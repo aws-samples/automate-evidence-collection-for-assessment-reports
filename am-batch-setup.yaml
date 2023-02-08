@@ -1,0 +1,413 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this
+# software and associated documentation files (the "Software"), to deal in the Software
+# without restriction, including without limitation the rights to use, copy, modify,
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Generating Audit Manager report with AWS Batch in Fargate'
+# Input parameters
+Parameters:
+  VpcCidrRange:
+    Type: String
+    Description: CIDR range for the new VPC to be created
+    Default: "192.168.0.0/24"
+  PublicSubnetCidrRange:
+    Type: String
+    Description: CIDR range for the public subnet
+    Default: "192.168.0.0/25"
+  PrivateSubnetCidrRange:
+    Type: String
+    Description: CIDR range for the private subnet
+    Default: "192.168.0.128/25"
+  TopicName:
+    Type: String
+    Description: Name of the SNS topic
+    Default: "assessment-report-notifier"
+  AssessmentName:
+    Type: String
+    MinLength: "1"
+    Description: (required) name of the audit manager assesment for which the report is to be generated
+  FilterLatest:
+    Type: String
+    Default: 'True'
+    Description: (optional) if set to 'True' associates only lastest evidences to the assesment report
+    AllowedValues:
+      - 'True'
+      - 'False'
+  FilterAutomatic:
+    Type: String
+    Default: 'False'
+    Description: (optional) if set to 'True' excludes manual evidence from the assesment report
+    AllowedValues:
+      - 'True'
+      - 'False'
+  FilterAccountIds:
+    Type: String
+    Description: (optional) comma seperated AWS Accounts ids for which the report is to be generated
+  
+# Metadeta :- groups the input parameters to logical labels
+Metadata:
+  "AWS::CloudFormation::Interface":
+    ParameterGroups:
+      - Label:
+          default: Generic parameters
+        Parameters:
+          - TopicName
+      - Label:
+          default: New VPC Details
+        Parameters:
+          - VpcCidrRange
+          - PublicSubnetCidrRange
+          - PrivateSubnetCidrRange
+      - Label:
+          default: Audit manager assessment details
+        Parameters:
+          - AssessmentName
+          - FilterLatest
+          - FilterAutomatic
+          - FilterAccountIds
+# Conditions
+Conditions:
+  AccountIdsExist: !Equals
+    - !Ref FilterAccountIds
+    - ''
+Resources:
+# VPC and related resources to provision the compute environment for the batch
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidrRange
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'  
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  PublicSubnetRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: VPC
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId:
+        Ref: VPC
+      InternetGatewayId:
+        Ref: InternetGateway
+  NATEIP:
+    DependsOn: VPCGatewayAttachment
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc        
+  NATGateway:
+      DependsOn: VPCGatewayAttachment
+      Type: AWS::EC2::NatGateway
+      Properties:
+        AllocationId:
+          Fn::GetAtt:
+          - NATEIP
+          - AllocationId
+        SubnetId:
+          Ref: PublicSubnet    
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 Security Group for instances launched in the VPC by Batch
+      VpcId:
+        Ref: VPC
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Ref PublicSubnetCidrRange
+      VpcId:
+        Ref: VPC
+      MapPublicIpOnLaunch: 'True'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-subnet'  
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Ref PrivateSubnetCidrRange
+      VpcId:
+        Ref: VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-subnet'  
+  PublicSubnetRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-rt'              
+  PublicSubnetRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: 
+        Ref: PublicSubnetRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId:
+        Ref: InternetGateway
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId:
+        Ref: PublicSubnet
+      RouteTableId:
+        Ref: PublicSubnetRouteTable
+  PrivateSubnetRouteTable:
+      Type: AWS::EC2::RouteTable
+      Properties:
+        VpcId:
+          Ref: VPC
+        Tags:
+          - Key: Name
+            Value: !Sub '${AWS::StackName}-private-rt'                  
+  PrivateSubnetRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref 'PrivateSubnetRouteTable'
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId:
+        Ref: NATGateway
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId:
+        Ref: PrivateSubnet
+      RouteTableId:
+        Ref: PrivateSubnetRouteTable
+
+# Service IAM role for AWS Batch
+  BatchServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: batch.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole
+# Job definition specifying how jobs are to be run. While each job must reference a job definition, many of the parameters that are specified in the job definition
+#can be overridden at runtime.
+  BatchProcessingJobDefinition:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      Type: container
+      PropagateTags: true
+      JobDefinitionName: !Sub '${AWS::StackName}-BatchJobDefinition'
+      ContainerProperties:
+        Image:
+          Fn::Join:
+          - ''
+          - - Ref: AWS::AccountId
+            - .dkr.ecr.
+            - Ref: AWS::Region
+            - !Sub '.amazonaws.com/${AWS::StackName}-repository:latest'
+        FargatePlatformConfiguration:
+          PlatformVersion: LATEST
+        ResourceRequirements:
+          - Value: 0.25
+            Type: VCPU
+          - Value: 512
+            Type: MEMORY
+        JobRoleArn:  !GetAtt 'BatchTaskExecutionRole.Arn'
+        ExecutionRoleArn:  !GetAtt 'BatchTaskExecutionRole.Arn'
+        LogConfiguration:
+          LogDriver:  awslogs
+          Options:
+            awslogs-group: !Ref 'BatchLogGroup'
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: !Sub '${AWS::StackName}-logs'  
+        Command:
+        - python3 
+        - script.py
+        - --name
+        - !Ref AssessmentName
+        - --filter_automatic
+        - !Ref FilterAutomatic
+        - --filter_latest
+        - !Ref FilterLatest
+        - --account_Ids
+        - !If
+            - AccountIdsExist
+            - "EMPTY"
+            - !Ref FilterAccountIds
+        - --sns_topic
+        - !Ref SNSNotification
+      PlatformCapabilities:
+      - FARGATE
+      Tags:
+        Automation: audit-manager-report-generator
+# log group for batch job logs
+  BatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub '${AWS::StackName}-awslogs'
+      RetentionInDays: 7
+# IAM role with needed permissions for the batch to successfully execute
+  BatchTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-taskexec-role'
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ecs-tasks.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+        - PolicyName: AmazonECSTaskExecutionRolePolicy
+          PolicyDocument:
+            Statement:
+            - Effect: Allow
+              Action:
+                - 'ecr:GetAuthorizationToken'
+                - 'ecr:BatchCheckLayerAvailability'
+                - 'ecr:GetDownloadUrlForLayer'
+                - 'ecr:BatchGetImage'
+                - 'logs:CreateLogStream'
+                - 'logs:PutLogEvents'
+                - 'SNS:Publish'
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - 'auditmanager:BatchAssociateAssessmentReportEvidence'
+                - 'auditmanager:ListAssessments'
+                - 'auditmanager:GetAssessmentReportUrl'
+                - 'auditmanager:GetAssessment'
+                - 'auditmanager:GetEvidenceByEvidenceFolder'
+                - 'auditmanager:GetEvidenceFoldersByAssessment'
+                - 'auditmanager:GetAccountStatus'
+                - 'auditmanager:ListAssessmentReports'
+                - 'auditmanager:CreateAssessmentReport'
+              Resource: !Sub 'arn:aws:auditmanager:*:${AWS::AccountId}:assessment/*'
+            - Effect: Allow
+              Action:
+                - 'auditmanager:ListAssessments'
+                - 'auditmanager:GetAccountStatus'
+                - 'auditmanager:ListAssessmentReports'
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - 's3:PutObject'
+                - 's3:GetObject'
+                - 's3:ListBucket'
+                - 's3:GetBucketLocation'
+                - 's3:PutObjectAcl'
+              Resource: '*'
+# ECR repository for storing the docker image
+  BatchProcessRepository: 
+    Type: AWS::ECR::Repository
+    Properties: 
+      RepositoryName: !Sub '${AWS::StackName}-repository'
+# Processing queue for the batch
+  BatchProcessingJobQueue:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      JobQueueName:  !Sub '${AWS::StackName}-queue'
+      State: ENABLED
+      Priority: 1
+      ComputeEnvironmentOrder:
+      - Order: 1
+        ComputeEnvironment:
+          Ref: ComputeEnvironment
+#Creates a Compute environment for the batch to run in
+  ComputeEnvironment:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      Type: MANAGED
+      State: ENABLED
+      ComputeResources:
+        Type: FARGATE
+        MaxvCpus: 40
+        Subnets:
+          - !Ref PrivateSubnet
+        SecurityGroupIds:
+          - !Ref SecurityGroup
+      ServiceRole:
+        Ref: BatchServiceRole
+
+# SnS Topic
+  SNSNotification:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Ref TopicName
+      TopicName: !Ref TopicName
+
+#SnS Topic Policy
+  SNSNotificationPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F18
+            reason: "Conditions restrict permissions to owning accounts only"
+    Properties:
+      Topics:
+        - !Ref SNSNotification
+      PolicyDocument:
+        Statement:
+          - Sid: __default_statement_ID
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"      
+            Action:
+            - SNS:GetTopicAttributes
+            - SNS:SetTopicAttributes
+            - SNS:AddPermission
+            - SNS:RemovePermission
+            - SNS:DeleteTopic
+            - SNS:Subscribe
+            - SNS:ListSubscriptionsByTopic
+            - SNS:Publish
+            - SNS:Receive
+            Resource: !Ref SNSNotification
+            Condition:
+              StringEquals:
+                AWS:SourceOwner: !Sub ${AWS::AccountId}
+
+Outputs:
+  ComputeEnvironmentArn:
+    Value:
+      Ref: ComputeEnvironment
+  BatchProcessingJobQueueArn:
+    Value:
+      Ref: BatchProcessingJobQueue
+  BatchProcessingJobDefinitionArn:
+    Value:
+      Ref: BatchProcessingJobDefinition
+  VPCId:
+    Value:
+      Ref: VPC
+  SecurityGroupId:
+    Value:
+      Ref: SecurityGroup
+  PublicSubnetId:
+    Value:
+      Ref: PublicSubnet
+  PrivateSubnetId:
+    Value:
+      Ref: PrivateSubnet
+  SNSTopic:
+    Value:
+      Ref: SNSNotification
